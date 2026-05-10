@@ -1,8 +1,9 @@
-//! Connection handler: performs the SOCKS5 handshake, opens the upstream
-//! connection, and relays bytes without logging identifying connection
-//! metadata.
+//! Connection handler: performs protocol detection, then routes to
+//! SOCKS5 or HTTP CONNECT. Relays bytes without logging identifying
+//! connection metadata.
 
 use crate::config::Config;
+use crate::http_tunnel;
 use crate::socks5::{
     self, HandshakeError, REP_CONNECTION_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE,
     REP_NETWORK_UNREACHABLE, REP_SUCCESS, TargetAddr,
@@ -14,8 +15,43 @@ use tokio::task::JoinError;
 use tokio::time::{Duration, timeout};
 use tracing::{Instrument, error, info, info_span, warn};
 
-/// Handle one SOCKS5 client session end-to-end.
+/// Handle one client session end-to-end.
+///
+/// Peeks the first byte of the incoming stream to detect the protocol:
+/// - `0x05` → SOCKS5 (full auth + CONNECT handshake)
+/// - `0x43` (`C`) → HTTP CONNECT tunnel (loopback-only, no auth)
+/// - anything else → rejected immediately
 pub async fn handle_client(
+    client: TcpStream,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // ── Protocol detection via peek ────────────────────────────
+    let mut peek_buf = [0u8; 1];
+    let n = client.peek(&mut peek_buf).await?;
+    if n == 0 {
+        // Client disconnected before sending any data.
+        return Ok(());
+    }
+
+    match peek_buf[0] {
+        0x05 => handle_socks5(client, config).await,
+        b'C' => {
+            info!(status = "HTTP_CONNECT_DETECTED", "Routing to HTTP CONNECT handler");
+            http_tunnel::handle_http_connect(client, config).await
+        }
+        other => {
+            warn!(
+                byte = format!("{:#04x}", other),
+                status = "UNKNOWN_PROTOCOL",
+                "Rejected connection: unrecognized protocol byte"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Handle one SOCKS5 client session end-to-end.
+async fn handle_socks5(
     mut client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
