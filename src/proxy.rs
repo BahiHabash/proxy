@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::http_tunnel;
 use crate::socks5::{
-    self, HandshakeError, REP_CONNECTION_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE,
+    self, HandshakeError, REP_CONNECTION_NOT_ALLOWED, REP_CONNECTION_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE,
     REP_NETWORK_UNREACHABLE, REP_SUCCESS, TargetAddr,
 };
 use std::io::{self, ErrorKind};
@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinError;
 use tokio::time::{Duration, timeout};
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 /// Handle one client session end-to-end.
 ///
@@ -36,7 +36,7 @@ pub async fn handle_client(
     match peek_buf[0] {
         0x05 => handle_socks5(client, config).await,
         b'C' => {
-            info!(status = "HTTP_CONNECT_DETECTED", "Routing to HTTP CONNECT handler");
+            debug!(status = "HTTP_CONNECT_DETECTED", "Routing to HTTP CONNECT handler");
             http_tunnel::handle_http_connect(client, config).await
         }
         other => {
@@ -55,24 +55,31 @@ async fn handle_socks5(
     mut client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let span = info_span!("session");
+    let target = match socks5::handshake(
+        &mut client,
+        &config.auth_username,
+        &config.auth_password,
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(error) => {
+            log_handshake_error(&error);
+            return Ok(());
+        }
+    };
+
+    let span = info_span!("socks5_tunnel", host = %target.host(), port = target.port());
 
     async {
-        let target = match socks5::handshake(
-            &mut client,
-            &config.auth_username,
-            &config.auth_password,
-        )
-        .await
-        {
-            Ok(target) => target,
-            Err(error) => {
-                log_handshake_error(&error);
-                return Ok(());
-            }
-        };
+        // Prevent proxy loop if the target is the proxy itself
+        if target.port() == config.bind_port && (target.host() == "127.0.0.1" || target.host() == "::1" || target.host() == "localhost" || target.host() == config.bind_host) {
+            warn!(status = "LOOP_DETECTED", "Rejected connection to proxy itself");
+            let _ = socks5::send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED).await;
+            return Ok(());
+        }
 
-        info!(status = "REQUEST_ACCEPTED", "CONNECT request accepted");
+        debug!(status = "REQUEST_ACCEPTED", "CONNECT request accepted");
 
         let connect_timeout = Duration::from_secs(config.upstream_connection_timeout_sec);
         let upstream_result = match &target {
@@ -94,7 +101,7 @@ async fn handle_socks5(
         let upstream = match upstream_result {
             Ok(Ok(stream)) => {
                 socks5::send_reply(&mut client, REP_SUCCESS).await?;
-                info!(status = "CONNECTED", "Upstream connection established");
+                debug!(status = "CONNECTED", "Upstream connection established");
                 stream
             }
             Ok(Err(error)) => {
@@ -142,7 +149,7 @@ async fn handle_socks5(
         log_relay_result("upload", upload_result);
         log_relay_result("download", download_result);
 
-        info!(status = "CLOSED", "Session complete");
+        info!(status = "CLOSED", "SOCKS5 session complete");
         Ok(())
     }
     .instrument(span)
@@ -164,7 +171,7 @@ fn log_handshake_error(error: &HandshakeError) {
     }
 }
 
-async fn relay_with_idle<R, W>(
+pub(crate) async fn relay_with_idle<R, W>(
     mut reader: R,
     mut writer: W,
     idle_timeout: Duration,
