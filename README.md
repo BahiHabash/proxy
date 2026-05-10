@@ -1,11 +1,12 @@
-# SOCKS5 Proxy Server
+# SOCKS5 / HTTP CONNECT Proxy Server
 
-A small Rust/Tokio SOCKS5 proxy with username/password authentication,
-configurable timeouts, graceful shutdown, and privacy-preserving routine logs.
+A small Rust/Tokio proxy that accepts SOCKS5 and local HTTP CONNECT clients on
+the same listener, with configurable timeouts, graceful shutdown, and
+privacy-preserving routine logs.
 
 ## Privacy Model
 
-This is a raw TCP SOCKS5 proxy. It can hide the client's source IP from the
+This is a raw TCP tunnel proxy. It can hide the client's source IP from the
 destination when traffic is actually routed through the proxy, and it does not
 inject HTTP headers such as `X-Forwarded-For`, `Forwarded`, or `Via`.
 
@@ -19,16 +20,17 @@ proxying TCP bytes.
 Use `socks5h://` or the equivalent "remote DNS" setting in clients. Plain
 `socks5://` clients may resolve DNS locally before connecting to the proxy.
 
-Routine logs intentionally omit client IPs, target hosts, target ports,
-attempted usernames, byte counts, and timing patterns.
+Routine logs omit client IPs, attempted usernames, byte counts, and timing patterns. Target hosts and ports are included in logs via `tracing` spans to help debug background connections (e.g., from IDE extensions).
 
 ## How It Works
 
 1. Reads configuration from environment variables or a local `.env` file.
 2. Accepts TCP clients on the configured bind address.
-3. Performs a SOCKS5 username/password handshake.
-4. Connects to the requested upstream address.
-5. Relays bytes in both directions until either side closes or the idle timeout
+3. Detects SOCKS5 vs HTTP CONNECT from the first byte.
+4. Performs SOCKS5 username/password auth, or accepts HTTP CONNECT from
+   loopback clients only.
+5. Connects to the requested upstream address.
+6. Relays bytes in both directions until either side closes or the idle timeout
    is reached.
 
 ## Configuration
@@ -54,6 +56,22 @@ cp .env.example .env
 cargo run --release
 ```
 
+If you already have `target/debug/socks5-proxy.exe` running on Windows, run
+tests with a separate target directory so Cargo does not try to replace the
+active executable:
+
+```powershell
+$env:CARGO_TARGET_DIR='target-test'
+$env:CARGO_BUILD_JOBS='1'
+cargo test
+```
+
+Otherwise:
+
+```bash
+cargo test
+```
+
 ## Run With Docker
 
 ```bash
@@ -67,8 +85,31 @@ docker run -d \
   socks5-proxy
 ```
 
+## Using with CLI Tools
+
+Because the proxy supports both SOCKS5 and HTTP CONNECT, you can easily route command-line tools (like `codex`, `curl`, `git`, or scripts) through it locally.
+
+For HTTP CONNECT (loopback, no auth required):
+```bash
+export HTTP_PROXY="http://127.0.0.1:1080"
+export HTTPS_PROXY="http://127.0.0.1:1080"
+```
+
+For SOCKS5 (with auth):
+```bash
+export ALL_PROXY="socks5://myuser:mypassword@127.0.0.1:1080"
+```
+
 ## Test
+
+SOCKS5:
 
 ```bash
 curl -x socks5h://myuser:mypassword@127.0.0.1:1080 https://ifconfig.me
+```
+
+HTTP CONNECT:
+
+```bash
+curl -x http://127.0.0.1:1080 https://ifconfig.me
 ```
