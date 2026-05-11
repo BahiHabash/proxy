@@ -32,6 +32,25 @@ async fn start_one_shot_proxy(config: Config) -> std::net::SocketAddr {
     addr
 }
 
+async fn start_proxy_accepting(config: Config, connection_count: usize) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        for _ in 0..connection_count {
+            let (client, _) = listener.accept().await.unwrap();
+            let config = config.clone();
+            tokio::spawn(async move {
+                socks5_proxy::proxy::handle_client(client, &config)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    addr
+}
+
 async fn write_method_and_auth(client: &mut TcpStream, username: &str, password: &str) {
     client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
 
@@ -206,4 +225,81 @@ async fn closes_idle_relay_without_payload() {
         .unwrap()
         .unwrap();
     assert_eq!(read, 0);
+}
+
+#[tokio::test]
+async fn same_listener_handles_socks5_and_http_connect_clients() {
+    let socks_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_upstream_addr = socks_upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = socks_upstream.accept().await.unwrap();
+        let mut request = [0_u8; 5];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"socks");
+        stream.write_all(b"ok-s5").await.unwrap();
+    });
+
+    let http_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_upstream_addr = http_upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = http_upstream.accept().await.unwrap();
+        let mut request = [0_u8; 4];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"http");
+        stream.write_all(b"ok-h").await.unwrap();
+    });
+
+    let proxy_addr = start_proxy_accepting(test_config(), 2).await;
+
+    let mut socks_client = TcpStream::connect(proxy_addr).await.unwrap();
+    write_method_and_auth(&mut socks_client, USER, PASS).await;
+    assert_auth_success(&mut socks_client).await;
+
+    let socks_ip = match socks_upstream_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => unreachable!("test binds IPv4"),
+    };
+    let mut socks_request = vec![0x05, 0x01, 0x00, 0x01];
+    socks_request.extend_from_slice(&socks_ip.octets());
+    socks_request.extend_from_slice(&socks_upstream_addr.port().to_be_bytes());
+    socks_client.write_all(&socks_request).await.unwrap();
+    assert_eq!(
+        read_socks_reply(&mut socks_client).await,
+        [0x05, REP_SUCCESS, 0, 1, 0, 0, 0, 0, 0, 0]
+    );
+
+    socks_client.write_all(b"socks").await.unwrap();
+    let mut socks_response = [0_u8; 5];
+    socks_client.read_exact(&mut socks_response).await.unwrap();
+    assert_eq!(&socks_response, b"ok-s5");
+
+    let mut http_client = TcpStream::connect(proxy_addr).await.unwrap();
+    let http_request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        http_upstream_addr.port(),
+        http_upstream_addr.port()
+    );
+    http_client
+        .write_all(http_request.as_bytes())
+        .await
+        .unwrap();
+
+    let mut http_head = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        http_client.read_exact(&mut byte).await.unwrap();
+        http_head.push(byte[0]);
+        if http_head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    assert_eq!(
+        String::from_utf8(http_head).unwrap(),
+        "HTTP/1.1 200 Connection Established\r\n\r\n"
+    );
+
+    http_client.write_all(b"http").await.unwrap();
+    let mut http_response = [0_u8; 4];
+    http_client.read_exact(&mut http_response).await.unwrap();
+    assert_eq!(&http_response, b"ok-h");
 }
