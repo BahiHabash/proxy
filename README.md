@@ -1,6 +1,6 @@
 # SOCKS5 / HTTP CONNECT Proxy Server
 
-A small Rust/Tokio proxy that accepts SOCKS5 and local HTTP CONNECT clients on
+A small Rust/Tokio proxy that accepts SOCKS5 and HTTP CONNECT clients on
 the same listener, with configurable timeouts, graceful shutdown, and
 privacy-preserving routine logs.
 
@@ -27,8 +27,8 @@ Routine logs omit client IPs, attempted usernames, byte counts, and timing patte
 1. Reads configuration from environment variables or a local `.env` file.
 2. Accepts TCP clients on the configured bind address.
 3. Detects SOCKS5 vs HTTP CONNECT from the first byte.
-4. Performs SOCKS5 username/password auth, or accepts HTTP CONNECT from
-   loopback clients only.
+4. Authenticates both SOCKS5 and HTTP CONNECT requests using the configured
+   username and password.
 5. Connects to the requested upstream address.
 6. Relays bytes in both directions until either side closes or the idle timeout
    is reached.
@@ -89,10 +89,10 @@ docker run -d \
 
 Because the proxy supports both SOCKS5 and HTTP CONNECT, you can easily route command-line tools (like `codex`, `curl`, `git`, or scripts) through it locally.
 
-For HTTP CONNECT (loopback, no auth required):
+For HTTP CONNECT:
 ```bash
-export HTTP_PROXY="http://127.0.0.1:1080"
-export HTTPS_PROXY="http://127.0.0.1:1080"
+export HTTP_PROXY="http://myuser:mypassword@127.0.0.1:1080"
+export HTTPS_PROXY="http://myuser:mypassword@127.0.0.1:1080"
 ```
 
 For SOCKS5 (with auth):
@@ -111,5 +111,5 @@ curl -x socks5h://myuser:mypassword@127.0.0.1:1080 https://ifconfig.me
 HTTP CONNECT:
 
 ```bash
-curl -x http://127.0.0.1:1080 https://ifconfig.me
+curl -x http://myuser:mypassword@127.0.0.1:1080 https://ifconfig.me
 ```
