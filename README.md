@@ -75,14 +75,14 @@ cargo test
 ## Run With Docker
 
 ```bash
-docker build -t socks5-proxy .
+docker build -t proxy .
 
 docker run -d \
-  --name socks5-proxy \
+  --name proxy \
   -p 1080:1080 \
   -e PROXY_USER=myuser \
   -e PROXY_PASS=mypassword \
-  socks5-proxy
+  proxy
 ```
 
 ## Using with CLI Tools
