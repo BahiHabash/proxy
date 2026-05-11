@@ -62,7 +62,7 @@ async fn http_connect_relays_bidirectional_tcp() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
 
     let request = format!(
-        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
         upstream_addr.port(),
         upstream_addr.port()
     );
@@ -94,7 +94,7 @@ async fn http_connect_preserves_payload_sent_after_headers() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
 
     let request = format!(
-        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\nearly",
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\nearly",
         upstream_addr.port(),
         upstream_addr.port()
     );
@@ -146,7 +146,7 @@ async fn http_connect_returns_bad_gateway_when_upstream_refuses() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
 
     let request = format!(
-        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
         closed_addr.port(),
         closed_addr.port()
     );
@@ -173,7 +173,7 @@ async fn http_connect_closes_idle_tunnel_without_payload() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
 
     let request = format!(
-        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
         upstream_addr.port(),
         upstream_addr.port()
     );
@@ -188,4 +188,18 @@ async fn http_connect_closes_idle_tunnel_without_payload() {
         .unwrap()
         .unwrap();
     assert_eq!(read, 0);
+}
+
+#[tokio::test]
+async fn http_connect_rejects_unauthenticated() {
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = format!(
+        "CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n"
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n");
 }

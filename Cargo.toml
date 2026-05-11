@@ -13,6 +13,7 @@ dotenvy = "0.15"
 ctrlc = { version = "3", features = ["termination"] }
 thiserror = "2"
 anyhow = "1"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

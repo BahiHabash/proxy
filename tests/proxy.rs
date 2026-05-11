@@ -275,7 +275,7 @@ async fn same_listener_handles_socks5_and_http_connect_clients() {
 
     let mut http_client = TcpStream::connect(proxy_addr).await.unwrap();
     let http_request = format!(
-        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
         http_upstream_addr.port(),
         http_upstream_addr.port()
     );

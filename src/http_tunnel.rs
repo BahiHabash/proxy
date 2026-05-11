@@ -1,12 +1,14 @@
 //! HTTP CONNECT tunnel handler.
 //!
-//! This module provides a fallback for local clients that send HTTP CONNECT
-//! requests instead of speaking SOCKS5.
+//! This module provides support for HTTP CONNECT proxy requests (used for
+//! HTTPS tunnelling). Clients are authenticated via Proxy-Authorization
+//! Basic header using the same credentials as the SOCKS5 handler.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::config::Config;
 use crate::proxy;
 use std::io;
-use std::net::IpAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
@@ -14,11 +16,13 @@ use tracing::{debug, info, warn, Instrument, info_span};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const CONNECTION_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\n";
 const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
 const HEADER_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n";
 const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
 const GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\n\r\n";
+const PROXY_AUTH_REQUIRED: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectTarget {
@@ -28,21 +32,13 @@ pub struct ConnectTarget {
 
 /// Handle an HTTP CONNECT tunnel request.
 ///
-/// This path is intentionally limited to loopback clients because it does not
-/// use SOCKS5 username/password authentication.
+/// Authenticates the client via `Proxy-Authorization: Basic` header
+/// using the same credentials configured for SOCKS5.
 pub async fn handle_http_connect(
     mut client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !is_loopback(&client.peer_addr()?.ip()) {
-        warn!(
-            status = "REJECTED",
-            "HTTP CONNECT rejected: non-loopback client"
-        );
-        write_response(&mut client, FORBIDDEN).await?;
-        return Ok(());
-    }
-
+    // ── Read full HTTP header ────────────────────────────────────
     let header =
         match read_connect_header(&mut client, Duration::from_secs(config.idle_timeout_secs))
             .await?
@@ -51,6 +47,7 @@ pub async fn handle_http_connect(
             None => return Ok(()),
         };
 
+    // ── Parse CONNECT target ────────────────────────────────────
     let target = match parse_connect_target(&header) {
         Some(target) => target,
         None => {
@@ -60,12 +57,43 @@ pub async fn handle_http_connect(
         }
     };
 
+    // ── Authenticate via Proxy-Authorization header ─────────────
+    let header_str = String::from_utf8_lossy(&header);
+    match parse_proxy_auth(&header_str) {
+        Some((user, pass))
+            if user == config.auth_username && pass == config.auth_password =>
+        {
+            // Auth OK
+        }
+        Some(_) => {
+            warn!(status = "AUTH_FAILED", "HTTP CONNECT authentication rejected");
+            write_response(&mut client, PROXY_AUTH_REQUIRED).await?;
+            return Ok(());
+        }
+        None => {
+            warn!(
+                status = "AUTH_MISSING",
+                "HTTP CONNECT missing Proxy-Authorization header"
+            );
+            write_response(&mut client, PROXY_AUTH_REQUIRED).await?;
+            return Ok(());
+        }
+    }
+
     let span = info_span!("http_tunnel", host = %target.host, port = target.port);
-    
+
     async {
         // Prevent proxy loop if the target is the proxy itself
-        if target.port == config.bind_port && (target.host == "127.0.0.1" || target.host == "::1" || target.host == "localhost" || target.host == config.bind_host) {
-            warn!(status = "LOOP_DETECTED", "Rejected connection to proxy itself");
+        if target.port == config.bind_port
+            && (target.host == "127.0.0.1"
+                || target.host == "::1"
+                || target.host == "localhost"
+                || target.host == config.bind_host)
+        {
+            warn!(
+                status = "LOOP_DETECTED",
+                "Rejected connection to proxy itself"
+            );
             write_response(&mut client, FORBIDDEN).await?;
             return Ok(());
         }
@@ -105,7 +133,7 @@ pub async fn handle_http_connect(
             Duration::from_secs(config.idle_timeout_secs),
         )
         .await;
-        
+
         info!(status = "TUNNEL_CLOSED", "HTTP tunnel closed");
 
         Ok(())
@@ -166,6 +194,36 @@ fn parse_connect_target(header: &[u8]) -> Option<ConnectTarget> {
     Some(ConnectTarget { host, port })
 }
 
+/// Extract username and password from the `Proxy-Authorization: Basic <b64>` header.
+fn parse_proxy_auth(header: &str) -> Option<(String, String)> {
+    for line in header.lines() {
+        let line = line.trim();
+        // Case-insensitive match on the header name
+        if let Some(value) = line
+            .strip_prefix("Proxy-Authorization:")
+            .or_else(|| line.strip_prefix("proxy-authorization:"))
+            .or_else(|| {
+                // Generic case-insensitive check
+                if line.len() > 21
+                    && line[..21].eq_ignore_ascii_case("proxy-authorization:")
+                {
+                    Some(&line[21..])
+                } else {
+                    None
+                }
+            })
+        {
+            let value = value.trim();
+            let b64 = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic "))?;
+            let decoded = BASE64.decode(b64.trim()).ok()?;
+            let decoded_str = String::from_utf8(decoded).ok()?;
+            let (user, pass) = decoded_str.split_once(':')?;
+            return Some((user.to_string(), pass.to_string()));
+        }
+    }
+    None
+}
+
 fn parse_authority(authority: &str) -> Option<(String, u16)> {
     if authority.is_empty() {
         return None;
@@ -213,8 +271,4 @@ async fn relay_with_idle(client: TcpStream, upstream: TcpStream, idle_timeout: D
     ));
 
     let _ = tokio::join!(upload, download);
-}
-
-fn is_loopback(ip: &IpAddr) -> bool {
-    ip.is_loopback()
 }
