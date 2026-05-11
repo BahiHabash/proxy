@@ -81,8 +81,7 @@ docker run -d \
   --name proxy \
   --restart unless-stopped \
   -p 1080:1080 \
-  -e PROXY_USER=myuser \
-  -e PROXY_PASS=mypassword \
+  --env-file .env \
   proxy
 ```
 
