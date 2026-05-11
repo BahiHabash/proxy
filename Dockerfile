@@ -1,10 +1,12 @@
 # ─── Build stage ──────────────────────────────────────────────
-FROM rust:1.87-slim AS builder
+FROM rust:1.94-slim AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY tests/ tests/
 
+RUN cargo test
 RUN cargo build --release
 
 # ─── Runtime stage ────────────────────────────────────────────
