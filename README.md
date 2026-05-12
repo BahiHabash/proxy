@@ -4,6 +4,8 @@ A small Rust/Tokio proxy that accepts SOCKS5 and HTTP CONNECT clients on
 the same listener, with configurable timeouts, graceful shutdown, and
 privacy-preserving routine logs.
 
+[how to use it](./guidelines/README.md)
+
 ## Privacy Model
 
 This is a raw TCP tunnel proxy. It can hide the client's source IP from the
@@ -90,12 +92,14 @@ docker run -d \
 Because the proxy supports both SOCKS5 and HTTP CONNECT, you can easily route command-line tools (like `codex`, `curl`, `git`, or scripts) through it locally.
 
 For HTTP CONNECT:
+
 ```bash
 export HTTP_PROXY="http://myuser:mypassword@127.0.0.1:1080"
 export HTTPS_PROXY="http://myuser:mypassword@127.0.0.1:1080"
 ```
 
 For SOCKS5 (with auth):
+
 ```bash
 export ALL_PROXY="socks5://myuser:mypassword@127.0.0.1:1080"
 ```
