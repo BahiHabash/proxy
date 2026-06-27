@@ -1,4 +1,4 @@
-use socks5_proxy::socks5::{
+use proxy::socks5::{
     HandshakeError, REP_ADDRESS_TYPE_NOT_SUPPORTED, REP_COMMAND_NOT_SUPPORTED,
     REP_CONNECTION_REFUSED, TargetAddr, handshake, send_reply,
 };

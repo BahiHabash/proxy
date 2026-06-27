@@ -1,5 +1,5 @@
 [package]
-name = "socks5-proxy"
+name = "proxy"
 version = "1.0.0"
 edition = "2024"
 description = "Production-ready SOCKS5 proxy server with RFC 1928/1929 compliance, observability logging, and SSE/WebSocket transparency."

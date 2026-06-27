@@ -27,8 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/socks5-proxy /usr/local/bin/socks5-proxy
+COPY --from=builder /build/target/release/proxy /usr/local/bin/proxy
 
 EXPOSE 1080
 
-ENTRYPOINT ["socks5-proxy"]
+ENTRYPOINT ["proxy"]

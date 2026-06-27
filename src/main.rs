@@ -1,4 +1,5 @@
-use socks5_proxy::{config::Config, proxy};
+use proxy::config::Config;
+use proxy::proxy as proxy_handler;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -44,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok((stream, _peer)) => {
                         let cfg = Arc::clone(&config);
                         tokio::spawn(async move {
-                            if let Err(e) = proxy::handle_client(stream, &cfg).await {
+                            if let Err(e) = proxy_handler::handle_client(stream, &cfg).await {
                                 error!(error = %e, "Session failed");
                             }
                         });

@@ -1,4 +1,6 @@
-use socks5_proxy::{config::Config, socks5::REP_SUCCESS};
+use proxy::config::Config;
+use proxy::proxy as proxy_handler;
+use proxy::socks5::REP_SUCCESS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
@@ -24,7 +26,7 @@ async fn start_one_shot_proxy(config: Config) -> std::net::SocketAddr {
 
     tokio::spawn(async move {
         let (client, _) = listener.accept().await.unwrap();
-        socks5_proxy::proxy::handle_client(client, &config)
+        proxy_handler::handle_client(client, &config)
             .await
             .unwrap();
     });
@@ -41,7 +43,7 @@ async fn start_proxy_accepting(config: Config, connection_count: usize) -> std::
             let (client, _) = listener.accept().await.unwrap();
             let config = config.clone();
             tokio::spawn(async move {
-                socks5_proxy::proxy::handle_client(client, &config)
+                proxy_handler::handle_client(client, &config)
                     .await
                     .unwrap();
             });
