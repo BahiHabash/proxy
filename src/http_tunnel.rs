@@ -16,13 +16,13 @@ use tracing::{debug, info, warn, Instrument, info_span};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const CONNECTION_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
-const HEADER_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n";
-const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
-const GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\n\r\n";
+const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+const HEADER_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
+const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
+const GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n";
 const PROXY_AUTH_REQUIRED: &[u8] =
-    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
-const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\n";
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\n\r\n";
+const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectTarget {
@@ -52,7 +52,7 @@ pub async fn handle_http_connect(
         Some(target) => target,
         None => {
             warn!(status = "BAD_REQUEST", "Invalid HTTP CONNECT request");
-            write_response(&mut client, BAD_REQUEST).await?;
+            write_error_response(&mut client, BAD_REQUEST).await?;
             return Ok(());
         }
     };
@@ -67,7 +67,7 @@ pub async fn handle_http_connect(
         }
         Some(_) => {
             warn!(status = "AUTH_FAILED", "HTTP CONNECT authentication rejected");
-            write_response(&mut client, PROXY_AUTH_REQUIRED).await?;
+            write_error_response(&mut client, PROXY_AUTH_REQUIRED).await?;
             return Ok(());
         }
         None => {
@@ -75,7 +75,7 @@ pub async fn handle_http_connect(
                 status = "AUTH_MISSING",
                 "HTTP CONNECT missing Proxy-Authorization header"
             );
-            write_response(&mut client, PROXY_AUTH_REQUIRED).await?;
+            write_error_response(&mut client, PROXY_AUTH_REQUIRED).await?;
             return Ok(());
         }
     }
@@ -94,7 +94,7 @@ pub async fn handle_http_connect(
                 status = "LOOP_DETECTED",
                 "Rejected connection to proxy itself"
             );
-            write_response(&mut client, FORBIDDEN).await?;
+            write_error_response(&mut client, FORBIDDEN).await?;
             return Ok(());
         }
 
@@ -114,12 +114,12 @@ pub async fn handle_http_connect(
                     error_kind = ?error.kind(),
                     "Failed to connect upstream for HTTP tunnel"
                 );
-                write_response(&mut client, BAD_GATEWAY).await?;
+                write_error_response(&mut client, BAD_GATEWAY).await?;
                 return Ok(());
             }
             Err(_elapsed) => {
                 warn!(status = "UPSTREAM_TIMEOUT", "Upstream connection timed out");
-                write_response(&mut client, GATEWAY_TIMEOUT).await?;
+                write_error_response(&mut client, GATEWAY_TIMEOUT).await?;
                 return Ok(());
             }
         };
@@ -164,7 +164,7 @@ async fn read_connect_header(
 
         header.push(byte[0]);
         if header.len() > MAX_HEADER_BYTES {
-            write_response(client, HEADER_TOO_LARGE).await?;
+            write_error_response(client, HEADER_TOO_LARGE).await?;
             return Ok(None);
         }
 
@@ -251,6 +251,13 @@ fn parse_authority(authority: &str) -> Option<(String, u16)> {
 async fn write_response(client: &mut TcpStream, response: &[u8]) -> io::Result<()> {
     client.write_all(response).await?;
     client.flush().await
+}
+
+async fn write_error_response(client: &mut TcpStream, response: &[u8]) -> io::Result<()> {
+    client.write_all(response).await?;
+    client.flush().await?;
+    let _ = client.shutdown().await;
+    Ok(())
 }
 
 async fn relay_with_idle(client: TcpStream, upstream: TcpStream, idle_timeout: Duration) {
