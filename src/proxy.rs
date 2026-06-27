@@ -19,8 +19,9 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 ///
 /// Peeks the first byte of the incoming stream to detect the protocol:
 /// - `0x05` → SOCKS5 (full auth + CONNECT handshake)
-/// - `0x43` (`C`) → HTTP CONNECT tunnel (loopback-only, no auth)
-/// - anything else → rejected immediately
+/// - `0x43` (`C`) → HTTP CONNECT tunnel
+/// - HTTP method bytes (`G`, `P`, `H`, `D`, `O`) → rejected with 405
+/// - anything else → rejected immediately (silent close)
 pub async fn handle_client(
     client: TcpStream,
     config: &Config,
@@ -39,6 +40,17 @@ pub async fn handle_client(
             debug!(status = "HTTP_CONNECT_DETECTED", "Routing to HTTP CONNECT handler");
             http_tunnel::handle_http_connect(client, config).await
         }
+        // Plain HTTP method bytes: GET, POST, PUT, PATCH, HEAD, DELETE, OPTIONS
+        // These are non-tunnelled HTTP requests. This proxy only supports CONNECT
+        // tunnelling; respond with 405 and close gracefully instead of TCP reset.
+        b'G' | b'P' | b'H' | b'D' | b'O' => {
+            warn!(
+                byte = format!("{:#04x}", peek_buf[0]),
+                status = "PLAIN_HTTP_REJECTED",
+                "Rejected plain HTTP request: only CONNECT tunnelling is supported"
+            );
+            reject_plain_http(client).await
+        }
         other => {
             warn!(
                 byte = format!("{:#04x}", other),
@@ -48,6 +60,23 @@ pub async fn handle_client(
             Ok(())
         }
     }
+}
+
+/// Send a `405 Method Not Allowed` response and shut down the connection
+/// gracefully so the client receives the error instead of a TCP reset.
+async fn reject_plain_http(
+    mut client: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncWriteExt;
+    const RESPONSE: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\
+        Connection: close\r\n\
+        Content-Length: 85\r\n\
+        Content-Type: text/plain\r\n\r\n\
+        This proxy only supports HTTP CONNECT tunnelling. Use CONNECT or SOCKS5.";
+    client.write_all(RESPONSE).await?;
+    client.flush().await?;
+    let _ = client.shutdown().await;
+    Ok(())
 }
 
 /// Handle one SOCKS5 client session end-to-end.
