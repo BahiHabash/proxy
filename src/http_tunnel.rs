@@ -20,9 +20,16 @@ const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r
 const HEADER_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
 const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
 const GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n";
-const PROXY_AUTH_REQUIRED: &[u8] =
-    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\n\r\n";
 const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+
+/// 407 with keep-alive — sent when we challenge the client to provide credentials.
+/// We do NOT include `Connection: close` so the client can retry on the same socket.
+const PROXY_AUTH_REQUIRED: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n";
+
+/// 407 with close — sent after too many failed attempts.
+const PROXY_AUTH_REQUIRED_CLOSE: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectTarget {
@@ -34,51 +41,80 @@ pub struct ConnectTarget {
 ///
 /// Authenticates the client via `Proxy-Authorization: Basic` header
 /// using the same credentials configured for SOCKS5.
+///
+/// RFC 7235 compliance: after a 407 the connection is kept alive so the
+/// client (e.g. Node.js/npm) can retry CONNECT with credentials on the
+/// same TCP socket without reconnecting.
 pub async fn handle_http_connect(
     mut client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // ── Read full HTTP header ────────────────────────────────────
-    let header =
-        match read_connect_header(&mut client, Duration::from_secs(config.idle_timeout_secs))
-            .await?
-        {
-            Some(header) => header,
-            None => return Ok(()),
+    // RFC 7235: after a 407 the proxy keeps the connection open so the
+    // client can retry on the same TCP socket with credentials.
+    // Node.js / npm (and many other HTTP stacks) rely on this: they never
+    // open a second connection after a 407; they just re-send CONNECT on
+    // the same one.
+    const MAX_AUTH_ATTEMPTS: u8 = 3;
+    let mut auth_attempts: u8 = 0;
+
+    let target = loop {
+        // ── Read full HTTP header ──────────────────────────────────
+        let header =
+            match read_connect_header(&mut client, Duration::from_secs(config.idle_timeout_secs))
+                .await?
+            {
+                Some(header) => header,
+                None => return Ok(()),
+            };
+
+        // ── Parse CONNECT target ───────────────────────────────────
+        let target = match parse_connect_target(&header) {
+            Some(target) => target,
+            None => {
+                warn!(status = "BAD_REQUEST", "Invalid HTTP CONNECT request");
+                write_error_response(&mut client, BAD_REQUEST).await?;
+                return Ok(());
+            }
         };
 
-    // ── Parse CONNECT target ────────────────────────────────────
-    let target = match parse_connect_target(&header) {
-        Some(target) => target,
-        None => {
-            warn!(status = "BAD_REQUEST", "Invalid HTTP CONNECT request");
-            write_error_response(&mut client, BAD_REQUEST).await?;
-            return Ok(());
+        // ── Authenticate via Proxy-Authorization header ────────────
+        let header_str = String::from_utf8_lossy(&header);
+        match parse_proxy_auth(&header_str) {
+            Some((user, pass)) if user == config.auth_username && pass == config.auth_password => {
+                // Auth OK — proceed to tunnel
+                break target;
+            }
+            Some(_) => {
+                auth_attempts += 1;
+                warn!(
+                    status = "AUTH_FAILED",
+                    attempt = auth_attempts,
+                    "HTTP CONNECT authentication rejected"
+                );
+                if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                    // Too many failures — close the connection
+                    write_error_response(&mut client, PROXY_AUTH_REQUIRED_CLOSE).await?;
+                    return Ok(());
+                }
+                // Keep connection alive — client can retry with correct credentials
+                write_response(&mut client, PROXY_AUTH_REQUIRED).await?;
+            }
+            None => {
+                auth_attempts += 1;
+                warn!(
+                    status = "AUTH_MISSING",
+                    attempt = auth_attempts,
+                    "HTTP CONNECT missing Proxy-Authorization header"
+                );
+                if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                    write_error_response(&mut client, PROXY_AUTH_REQUIRED_CLOSE).await?;
+                    return Ok(());
+                }
+                // Keep connection alive — client is expected to retry with credentials
+                write_response(&mut client, PROXY_AUTH_REQUIRED).await?;
+            }
         }
     };
-
-    // ── Authenticate via Proxy-Authorization header ─────────────
-    let header_str = String::from_utf8_lossy(&header);
-    match parse_proxy_auth(&header_str) {
-        Some((user, pass))
-            if user == config.auth_username && pass == config.auth_password =>
-        {
-            // Auth OK
-        }
-        Some(_) => {
-            warn!(status = "AUTH_FAILED", "HTTP CONNECT authentication rejected");
-            write_error_response(&mut client, PROXY_AUTH_REQUIRED).await?;
-            return Ok(());
-        }
-        None => {
-            warn!(
-                status = "AUTH_MISSING",
-                "HTTP CONNECT missing Proxy-Authorization header"
-            );
-            write_error_response(&mut client, PROXY_AUTH_REQUIRED).await?;
-            return Ok(());
-        }
-    }
 
     let span = info_span!("http_tunnel", host = %target.host, port = target.port);
 

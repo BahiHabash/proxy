@@ -201,5 +201,5 @@ async fn http_connect_rejects_unauthenticated() {
     client.write_all(request.as_bytes()).await.unwrap();
 
     let response = read_http_response_head(&mut client).await;
-    assert_eq!(response, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\n\r\n");
+    assert_eq!(response, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n");
 }
