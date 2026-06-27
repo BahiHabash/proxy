@@ -16,11 +16,11 @@ use tracing::{debug, info, warn, Instrument, info_span};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const CONNECTION_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
-const HEADER_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
-const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
-const GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n";
-const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const HEADER_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// 407 with keep-alive — sent when we challenge the client to provide credentials.
 /// We do NOT include `Connection: close` so the client can retry on the same socket.
@@ -245,7 +245,7 @@ fn parse_connect_target(header: &[u8]) -> Option<ConnectTarget> {
         return None;
     }
 
-    let (host, port) = parse_authority(authority)?;
+    let (host, port) = parse_authority(authority, Some(443))?;
     Some(ConnectTarget { host, port })
 }
 
@@ -283,28 +283,42 @@ fn parse_proxy_auth(header: &str) -> Option<(String, String)> {
     None
 }
 
-fn parse_authority(authority: &str) -> Option<(String, u16)> {
+fn parse_authority(authority: &str, default_port: Option<u16>) -> Option<(String, u16)> {
     if authority.is_empty() {
         return None;
     }
 
     if authority.starts_with('[') {
         let bracket_end = authority.find(']')?;
-        if authority.as_bytes().get(bracket_end + 1) != Some(&b':') {
+        let host = &authority[..=bracket_end];
+        if authority.as_bytes().get(bracket_end + 1) == Some(&b':') {
+            let port = authority[bracket_end + 2..].parse().ok()?;
+            return Some((host.to_string(), port));
+        } else if let Some(p) = default_port {
+            return Some((host.to_string(), p));
+        } else {
             return None;
         }
-        let host = &authority[..=bracket_end];
-        let port = authority[bracket_end + 2..].parse().ok()?;
-        return Some((host.to_string(), port));
     }
 
-    let colon = authority.rfind(':')?;
-    let host = &authority[..colon];
-    if host.is_empty() || host.contains(':') {
-        return None;
+    if let Some(colon) = authority.rfind(':') {
+        let host = &authority[..colon];
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        let port = authority[colon + 1..].parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let host = authority;
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        if let Some(p) = default_port {
+            Some((host.to_string(), p))
+        } else {
+            None
+        }
     }
-    let port = authority[colon + 1..].parse().ok()?;
-    Some((host.to_string(), port))
 }
 
 async fn write_response(client: &mut TcpStream, response: &[u8]) -> io::Result<()> {
@@ -421,14 +435,14 @@ pub async fn handle_plain_http(
     };
 
     // Parse host and port
-    let (host, port) = match parse_authority(authority) {
+    let (host, port) = match parse_authority(authority, Some(80)) {
         Some(hp) => hp,
         None => {
             // Fall back to Host header
             let host_line = header_str
                 .lines()
                 .find(|l| l.len() > 5 && l[..5].eq_ignore_ascii_case("host:"));
-            match host_line.and_then(|l| parse_authority(l[5..].trim())) {
+            match host_line.and_then(|l| parse_authority(l[5..].trim(), Some(80))) {
                 Some(hp) => hp,
                 None => {
                     warn!(status = "BAD_REQUEST", "Could not determine target host for plain HTTP");

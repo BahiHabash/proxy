@@ -115,12 +115,12 @@ async fn http_connect_rejects_malformed_connect_request() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
 
     client
-        .write_all(b"CONNECT missing-port HTTP/1.1\r\n\r\n")
+        .write_all(b"CONNECT missing-port:notanumber HTTP/1.1\r\n\r\n")
         .await
         .unwrap();
 
     let response = read_http_response_head(&mut client).await;
-    assert_eq!(response, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    assert_eq!(response, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 }
 
 #[tokio::test]
@@ -133,7 +133,7 @@ async fn http_connect_rejects_oversized_headers() {
     let response = read_http_response_head(&mut client).await;
     assert_eq!(
         response,
-        "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     );
 }
 
@@ -155,8 +155,8 @@ async fn http_connect_returns_bad_gateway_when_upstream_refuses() {
 
     let response = read_http_response_head(&mut client).await;
     assert!(
-        response == "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
-            || response == "HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n"
+        response == "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            || response == "HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     );
 }
 
