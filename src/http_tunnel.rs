@@ -54,19 +54,29 @@ pub async fn handle_http_connect(
     // Node.js / npm (and many other HTTP stacks) rely on this: they never
     // open a second connection after a 407; they just re-send CONNECT on
     // the same one.
+    //
+    // However, some clients (e.g. undici, the engine behind Codex CLI) do NOT
+    // support 407 retry on the same connection — they close the socket after a
+    // 407 and open a fresh one with credentials. To avoid holding dead slots
+    // open for `upstream_connection_timeout_sec` (30s) × N concurrent init
+    // connections, we use a short 2-second timeout on retry reads: if the
+    // client closed after 407 we detect EOF fast and the new connection
+    // (which arrives with credentials already set) gets served immediately.
     const MAX_AUTH_ATTEMPTS: u8 = 3;
+    const RETRY_READ_TIMEOUT_SECS: u64 = 2;
     let mut auth_attempts: u8 = 0;
 
     let target = loop {
         // ── Read full HTTP header ──────────────────────────────────
-        // Use the upstream connection timeout (not idle timeout) so a slow/stalled
-        // client cannot hold a connection slot open for hundreds of seconds.
-        let header = match read_connect_header(
-            &mut client,
-            Duration::from_secs(config.upstream_connection_timeout_sec),
-        )
-        .await?
-        {
+        // First attempt uses the full connection timeout; subsequent attempts
+        // (after a 407 challenge) use a short timeout so dead connections
+        // are cleaned up quickly.
+        let header_timeout = if auth_attempts == 0 {
+            Duration::from_secs(config.upstream_connection_timeout_sec)
+        } else {
+            Duration::from_secs(RETRY_READ_TIMEOUT_SECS)
+        };
+        let header = match read_connect_header(&mut client, header_timeout).await? {
             Some(header) => header,
             None => return Ok(()),
         };
@@ -327,4 +337,164 @@ async fn relay_with_idle(client: TcpStream, upstream: TcpStream, idle_timeout: D
     ));
 
     let _ = tokio::join!(upload, download);
+}
+
+/// Forward-proxy handler for plain `http://` requests.
+///
+/// Called when the first byte is a plain HTTP method (`G`, `P`, `H`, `D`, `O`).
+/// Clients like Node.js `proxy-from-env` route ALL traffic (both `http://` and
+/// `https://`) through `HTTPS_PROXY`. For `http://` targets they send the full
+/// request in absolute-form (`GET http://host/path HTTP/1.1`) to the proxy
+/// rather than using `CONNECT`.
+///
+/// This handler:
+/// 1. Reads the full request header.
+/// 2. Checks `Proxy-Authorization` (same credentials as CONNECT).
+/// 3. Extracts the target host/port from the absolute-form URI or `Host` header.
+/// 4. Connects to the upstream and writes the rewritten request (origin-form).
+/// 5. Relays the response back to the client.
+pub async fn handle_plain_http(
+    mut client: TcpStream,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read the full HTTP request header.
+    let header = match read_connect_header(
+        &mut client,
+        Duration::from_secs(config.upstream_connection_timeout_sec),
+    )
+    .await?
+    {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+
+    let header_str = match std::str::from_utf8(&header) {
+        Ok(s) => s,
+        Err(_) => {
+            write_error_response(&mut client, BAD_REQUEST).await?;
+            return Ok(());
+        }
+    };
+
+    // ── Authenticate ─────────────────────────────────────────────
+    match parse_proxy_auth(header_str) {
+        Some((user, pass)) if user == config.auth_username && pass == config.auth_password => {}
+        Some(_) => {
+            warn!(status = "AUTH_FAILED", "Plain HTTP proxy authentication rejected");
+            write_error_response(&mut client, PROXY_AUTH_REQUIRED_CLOSE).await?;
+            return Ok(());
+        }
+        None => {
+            warn!(status = "AUTH_MISSING", "Plain HTTP proxy missing Proxy-Authorization");
+            write_error_response(&mut client, PROXY_AUTH_REQUIRED_CLOSE).await?;
+            return Ok(());
+        }
+    }
+
+    // ── Parse request line to extract target ────────────────────
+    // Expected: `METHOD http://host[:port]/path HTTP/1.x`
+    let request_line = match header_str.lines().next() {
+        Some(l) => l,
+        None => {
+            write_error_response(&mut client, BAD_REQUEST).await?;
+            return Ok(());
+        }
+    };
+    let mut parts = request_line.split_whitespace();
+    let method = match parts.next() { Some(m) => m, None => { write_error_response(&mut client, BAD_REQUEST).await?; return Ok(()); } };
+    let uri    = match parts.next() { Some(u) => u, None => { write_error_response(&mut client, BAD_REQUEST).await?; return Ok(()); } };
+    let version = match parts.next() { Some(v) => v, None => { write_error_response(&mut client, BAD_REQUEST).await?; return Ok(()); } };
+
+    // Strip scheme to get authority + path
+    let without_scheme = if let Some(rest) = uri.strip_prefix("http://") {
+        rest
+    } else {
+        // Not an absolute-form URI — fall back to Host header
+        uri
+    };
+
+    // Split authority from path: "host:port/path" → ("host:port", "/path")
+    let (authority, path) = if let Some(idx) = without_scheme.find('/') {
+        (&without_scheme[..idx], &without_scheme[idx..])
+    } else {
+        (without_scheme, "/")
+    };
+
+    // Parse host and port
+    let (host, port) = match parse_authority(authority) {
+        Some(hp) => hp,
+        None => {
+            // Fall back to Host header
+            let host_line = header_str
+                .lines()
+                .find(|l| l.len() > 5 && l[..5].eq_ignore_ascii_case("host:"));
+            match host_line.and_then(|l| parse_authority(l[5..].trim())) {
+                Some(hp) => hp,
+                None => {
+                    warn!(status = "BAD_REQUEST", "Could not determine target host for plain HTTP");
+                    write_error_response(&mut client, BAD_REQUEST).await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let span = info_span!("http_forward", host = %host, port = port);
+
+    async move {
+        let connect_timeout = Duration::from_secs(config.upstream_connection_timeout_sec);
+        let mut upstream = match timeout(
+            connect_timeout,
+            TcpStream::connect(format!("{}:{}", host, port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!(status = "UPSTREAM_FAILED", error_kind = ?e.kind(), "Plain HTTP upstream connect failed");
+                write_error_response(&mut client, BAD_GATEWAY).await?;
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(status = "UPSTREAM_TIMEOUT", "Plain HTTP upstream connect timed out");
+                write_error_response(&mut client, GATEWAY_TIMEOUT).await?;
+                return Ok(());
+            }
+        };
+
+        // Rewrite the request: replace absolute-form URI with origin-form,
+        // strip Proxy-Authorization and Proxy-Connection headers.
+        let rewritten = rewrite_plain_http_request(method, path, version, header_str);
+        if let Err(e) = upstream.write_all(rewritten.as_bytes()).await {
+            warn!(status = "UPSTREAM_WRITE_FAILED", error_kind = ?e.kind(), "Failed to write request to upstream");
+            write_error_response(&mut client, BAD_GATEWAY).await?;
+            return Ok(());
+        }
+
+        debug!(status = "HTTP_FORWARD", host = %host, port = port, "Plain HTTP request forwarded");
+
+        relay_with_idle(client, upstream, Duration::from_secs(config.idle_timeout_secs)).await;
+
+        info!(status = "HTTP_FORWARD_CLOSED", "Plain HTTP forward session closed");
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Rewrite a plain HTTP request for forwarding:
+/// - Replace absolute-form URI with origin-form (`/path`)
+/// - Remove `Proxy-Authorization` and `Proxy-Connection` hop-by-hop headers
+fn rewrite_plain_http_request(method: &str, path: &str, version: &str, header: &str) -> String {
+    let mut out = format!("{} {} {}\r\n", method, path, version);
+    // Skip the first line (request line) and rebuild headers
+    for line in header.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("proxy-authorization:") || lower.starts_with("proxy-connection:") {
+            continue; // Strip proxy-specific headers before forwarding
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out
 }

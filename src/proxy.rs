@@ -40,16 +40,14 @@ pub async fn handle_client(
             debug!(status = "HTTP_CONNECT_DETECTED", "Routing to HTTP CONNECT handler");
             http_tunnel::handle_http_connect(client, config).await
         }
-        // Plain HTTP method bytes: GET, POST, PUT, PATCH, HEAD, DELETE, OPTIONS
-        // These are non-tunnelled HTTP requests. This proxy only supports CONNECT
-        // tunnelling; respond with 405 and close gracefully instead of TCP reset.
+        // Plain HTTP method bytes sent by clients that route http:// through
+        // the proxy (e.g. Node.js proxy-from-env, MCP SSE connections).
+        // We implement a basic forward-proxy: read the full request, connect
+        // to the target host extracted from the absolute-form URI or Host
+        // header, write the request verbatim, and relay the response.
         b'G' | b'P' | b'H' | b'D' | b'O' => {
-            warn!(
-                byte = format!("{:#04x}", peek_buf[0]),
-                status = "PLAIN_HTTP_REJECTED",
-                "Rejected plain HTTP request: only CONNECT tunnelling is supported"
-            );
-            reject_plain_http(client).await
+            debug!(status = "PLAIN_HTTP_DETECTED", "Routing to HTTP forward-proxy handler");
+            http_tunnel::handle_plain_http(client, config).await
         }
         other => {
             warn!(
@@ -62,22 +60,7 @@ pub async fn handle_client(
     }
 }
 
-/// Send a `405 Method Not Allowed` response and shut down the connection
-/// gracefully so the client receives the error instead of a TCP reset.
-async fn reject_plain_http(
-    mut client: TcpStream,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::AsyncWriteExt;
-    const RESPONSE: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\
-        Connection: close\r\n\
-        Content-Length: 85\r\n\
-        Content-Type: text/plain\r\n\r\n\
-        This proxy only supports HTTP CONNECT tunnelling. Use CONNECT or SOCKS5.";
-    client.write_all(RESPONSE).await?;
-    client.flush().await?;
-    let _ = client.shutdown().await;
-    Ok(())
-}
+
 
 /// Handle one SOCKS5 client session end-to-end.
 async fn handle_socks5(
