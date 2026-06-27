@@ -203,3 +203,56 @@ async fn http_connect_rejects_unauthenticated() {
     let response = read_http_response_head(&mut client).await;
     assert_eq!(response, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n");
 }
+
+/// Codex CLI and some LangChain HTTP adapters send lowercase `basic` scheme.
+/// This is allowed by RFC 7235 (auth-scheme is case-insensitive).
+#[tokio::test]
+async fn http_connect_accepts_lowercase_basic_auth_scheme() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        stream.write_all(b"ok").await.unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    // "dXNlcjpwYXNz" == base64("user:pass")
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: basic dXNlcjpwYXNz\r\n\r\n",
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+}
+
+/// Some older curl builds and AI tooling wrappers send HTTP/1.0 CONNECT.
+/// We must accept it just like HTTP/1.1.
+#[tokio::test]
+async fn http_connect_accepts_http_1_0_connect() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        stream.write_all(b"ok").await.unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    // HTTP/1.0 instead of HTTP/1.1
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.0\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+}

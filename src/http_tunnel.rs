@@ -59,13 +59,17 @@ pub async fn handle_http_connect(
 
     let target = loop {
         // ── Read full HTTP header ──────────────────────────────────
-        let header =
-            match read_connect_header(&mut client, Duration::from_secs(config.idle_timeout_secs))
-                .await?
-            {
-                Some(header) => header,
-                None => return Ok(()),
-            };
+        // Use the upstream connection timeout (not idle timeout) so a slow/stalled
+        // client cannot hold a connection slot open for hundreds of seconds.
+        let header = match read_connect_header(
+            &mut client,
+            Duration::from_secs(config.upstream_connection_timeout_sec),
+        )
+        .await?
+        {
+            Some(header) => header,
+            None => return Ok(()),
+        };
 
         // ── Parse CONNECT target ───────────────────────────────────
         let target = match parse_connect_target(&header) {
@@ -222,7 +226,12 @@ fn parse_connect_target(header: &[u8]) -> Option<ConnectTarget> {
 
     let authority = parts.next()?;
     let version = parts.next()?;
-    if !version.starts_with("HTTP/") || parts.next().is_some() {
+    // Accept HTTP/1.0 and HTTP/1.1 — some AI tooling wrappers (e.g. older
+    // curl builds, Codex CLI helpers) send HTTP/1.0 CONNECT requests.
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return None;
+    }
+    if parts.next().is_some() {
         return None;
     }
 
@@ -231,31 +240,35 @@ fn parse_connect_target(header: &[u8]) -> Option<ConnectTarget> {
 }
 
 /// Extract username and password from the `Proxy-Authorization: Basic <b64>` header.
+///
+/// Fully case-insensitive on both the header name and the `Basic` scheme —
+/// many HTTP clients and AI agent frameworks (e.g. Codex CLI, LangChain HTTP
+/// adapters) send lowercase or mixed-case variants.
 fn parse_proxy_auth(header: &str) -> Option<(String, String)> {
+    // "proxy-authorization:" is exactly 20 characters.
+    const HEADER_NAME: &str = "proxy-authorization:";
+
     for line in header.lines() {
         let line = line.trim();
-        // Case-insensitive match on the header name
-        if let Some(value) = line
-            .strip_prefix("Proxy-Authorization:")
-            .or_else(|| line.strip_prefix("proxy-authorization:"))
-            .or_else(|| {
-                // Generic case-insensitive check
-                if line.len() > 21
-                    && line[..21].eq_ignore_ascii_case("proxy-authorization:")
-                {
-                    Some(&line[21..])
-                } else {
-                    None
-                }
-            })
-        {
-            let value = value.trim();
-            let b64 = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic "))?;
-            let decoded = BASE64.decode(b64.trim()).ok()?;
-            let decoded_str = String::from_utf8(decoded).ok()?;
-            let (user, pass) = decoded_str.split_once(':')?;
-            return Some((user.to_string(), pass.to_string()));
+        if line.len() <= HEADER_NAME.len() {
+            continue;
         }
+        let (prefix, rest) = line.split_at(HEADER_NAME.len());
+        if !prefix.eq_ignore_ascii_case(HEADER_NAME) {
+            continue;
+        }
+        let value = rest.trim();
+        // Accept both "Basic " and "basic " (RFC 7235 is case-insensitive on scheme)
+        let b64 = if value.len() > 6 && value[..6].eq_ignore_ascii_case("basic ") {
+            value[6..].trim()
+        } else {
+            continue;
+        };
+        let decoded = BASE64.decode(b64).ok()?;
+        let decoded_str = String::from_utf8(decoded).ok()?;
+        // Split on the first ':' only — passwords may contain colons (RFC 7617)
+        let (user, pass) = decoded_str.split_once(':')?;
+        return Some((user.to_string(), pass.to_string()));
     }
     None
 }

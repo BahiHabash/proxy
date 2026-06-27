@@ -161,6 +161,27 @@ pub async fn handshake(
     let cmd = stream.read_u8().await?;
     let _rsv = stream.read_u8().await?; // reserved byte
 
+    // Reject unsupported commands before we parse the address. We must still
+    // drain *all* address bytes (ATYP + addr + port) before sending the reply
+    // and returning. On Windows, closing a socket that has unread bytes in its
+    // receive buffer causes the kernel to emit RST instead of FIN, which races
+    // with our reply and can cause the client to lose it.
+    if cmd != CMD_CONNECT {
+        let atyp = stream.read_u8().await.unwrap_or(0);
+        let _ = match atyp {
+            ATYP_IPV4   => { let mut b = [0u8; 4 + 2];  stream.read_exact(&mut b).await.map(|_| ()) }
+            ATYP_IPV6   => { let mut b = [0u8; 16 + 2]; stream.read_exact(&mut b).await.map(|_| ()) }
+            ATYP_DOMAIN => {
+                let len = stream.read_u8().await.unwrap_or(0) as usize;
+                let mut b = vec![0u8; len + 2];
+                stream.read_exact(&mut b).await.map(|_| ())
+            }
+            _ => Ok(()),
+        };
+        send_reply(stream, REP_COMMAND_NOT_SUPPORTED).await?;
+        return Err(HandshakeError::UnsupportedCommand(cmd));
+    }
+
     let atyp = stream.read_u8().await?;
     let target = match atyp {
         ATYP_IPV4 => {
@@ -188,11 +209,6 @@ pub async fn handshake(
             return Err(HandshakeError::UnsupportedAddrType(atyp));
         }
     };
-
-    if cmd != CMD_CONNECT {
-        send_reply(stream, REP_COMMAND_NOT_SUPPORTED).await?;
-        return Err(HandshakeError::UnsupportedCommand(cmd));
-    }
 
     Ok(target)
 }
