@@ -119,7 +119,7 @@ async fn http_connect_rejects_malformed_connect_request() {
         .unwrap();
 
     let response = read_http_response_head(&mut client).await;
-    assert_eq!(response, "HTTP/1.1 400 Bad Request\r\n\r\n");
+    assert_eq!(response, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
 }
 
 #[tokio::test]
@@ -132,7 +132,7 @@ async fn http_connect_rejects_oversized_headers() {
     let response = read_http_response_head(&mut client).await;
     assert_eq!(
         response,
-        "HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"
+        "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"
     );
 }
 
@@ -154,8 +154,8 @@ async fn http_connect_returns_bad_gateway_when_upstream_refuses() {
 
     let response = read_http_response_head(&mut client).await;
     assert!(
-        response == "HTTP/1.1 502 Bad Gateway\r\n\r\n"
-            || response == "HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+        response == "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+            || response == "HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n"
     );
 }
 
@@ -201,5 +201,5 @@ async fn http_connect_rejects_unauthenticated() {
     client.write_all(request.as_bytes()).await.unwrap();
 
     let response = read_http_response_head(&mut client).await;
-    assert_eq!(response, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n");
+    assert_eq!(response, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\n\r\n");
 }
