@@ -69,6 +69,11 @@ impl Config {
     pub fn init_logging(&self) -> tracing_appender::non_blocking::WorkerGuard {
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
+        // Ensure the logs directory exists to prevent "os error 2" when building the rolling file appender
+        if let Err(e) = std::fs::create_dir_all("logs") {
+            eprintln!("Failed to create logs directory: {}", e);
+        }
+
         let file_appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("proxy.log")
@@ -82,11 +87,13 @@ impl Config {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt::layer().json().with_writer(non_blocking))
+                .with(fmt::layer().json().with_writer(std::io::stdout))
                 .init();
         } else {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt::layer().pretty().with_writer(non_blocking))
+                .with(fmt::layer().pretty().with_writer(std::io::stdout))
                 .init();
         }
 
