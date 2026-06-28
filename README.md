@@ -22,6 +22,10 @@ proxying TCP bytes.
 Use `socks5h://` or the equivalent "remote DNS" setting in clients. Plain
 `socks5://` clients may resolve DNS locally before connecting to the proxy.
 
+By default, the proxy rejects loopback, private, link-local, multicast, and
+metadata-service style destinations so authenticated users cannot accidentally
+use the proxy as a path into the VPS or its private network.
+
 Routine logs omit client IPs, attempted usernames, byte counts, and timing patterns. Target hosts and ports are included in logs via `tracing` spans to help debug background connections (e.g., from IDE extensions).
 
 ## How It Works
@@ -48,8 +52,23 @@ Optional:
 - `PROXY_PORT`: Bind port. Default: `1080`.
 - `IDLE_TIMEOUT_SECS`: Idle timeout in seconds. Default: `300`.
 - `UPSTREAM_CONNECTION_TIMEOUT_SEC`: Upstream connect timeout. Default: `30`.
+- `RELAY_BUFFER_BYTES`: Per-direction relay buffer size. Default: `16384`.
+- `RELAY_WRITE_TIMEOUT_SECS`: Timeout for stalled relay writes. Default: `60`.
+- `MAX_CONNECTIONS`: Maximum concurrently active client sessions. Default: `1024`.
+- `ALLOW_PRIVATE_DESTINATIONS`: Allow loopback/private/link-local upstreams. Default: `false`.
+- `PROTOCOL_DETECTION_TIMEOUT_SECS`: Timeout for the first protocol byte. Default: `5`.
+- `SOCKS5_HANDSHAKE_TIMEOUT_SECS`: Timeout for SOCKS5 negotiation/request parsing. Default: `10`.
+- `HTTP_HEADER_TIMEOUT_SECS`: Timeout for HTTP proxy request headers. Default: `10`.
+- `SHUTDOWN_TIMEOUT_SECS`: Maximum graceful shutdown drain time. Default: `30`.
+- `ACCEPT_ERROR_BACKOFF_MS`: Sleep after `accept()` errors. Default: `250`.
+- `ACCEPT_ERROR_LOG_INTERVAL_SECS`: Minimum interval between repeated accept-error logs. Default: `5`.
 - `RUST_LOG`: Tracing filter. Default: `info`.
 - `LOG_FORMAT`: `pretty` or `json`. Default: `pretty`.
+- `LOG_TO_STDOUT`: Emit logs to stdout. Default: `true`.
+- `LOG_TO_FILE`: Emit bounded one-day local file logs. Default: `false`.
+- `LOG_DIR`: File log directory when enabled. Default: `logs`.
+- `LOG_MAX_FILE_BYTES`: Active file size before rotation. Default: `10485760`.
+- `LOG_MAX_FILES`: Number of same-day rotated files to retain. Default: `5`.
 
 ## Run With Cargo
 

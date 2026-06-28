@@ -1,5 +1,7 @@
 use proxy::config::Config;
 use proxy::proxy as proxy_handler;
+use proxy::resource::ResourceGovernor;
+use proxy::session::Session;
 use proxy::socks5::REP_SUCCESS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,6 +19,21 @@ fn test_config() -> Config {
         idle_timeout_secs: 1,
         log_format: "pretty".into(),
         upstream_connection_timeout_sec: 1,
+        relay_buffer_bytes: 16 * 1024,
+        relay_write_timeout_secs: 1,
+        max_connections: 1024,
+        protocol_detection_timeout_secs: 1,
+        socks5_handshake_timeout_secs: 1,
+        http_header_timeout_secs: 1,
+        accept_error_backoff_ms: 10,
+        accept_error_log_interval_secs: 1,
+        log_to_stdout: true,
+        log_to_file: false,
+        log_dir: "logs".into(),
+        log_max_file_bytes: 1024 * 1024,
+        log_max_files: 2,
+        allow_private_destinations: true,
+        shutdown_timeout_secs: 1,
     }
 }
 
@@ -178,6 +195,25 @@ async fn sends_failure_reply_when_upstream_refuses_connection() {
 }
 
 #[tokio::test]
+async fn socks5_blocks_private_destinations_when_policy_disallows_them() {
+    let mut config = test_config();
+    config.allow_private_destinations = false;
+    let proxy_addr = start_one_shot_proxy(config).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    write_method_and_auth(&mut client, USER, PASS).await;
+    assert_auth_success(&mut client).await;
+
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    request.extend_from_slice(&[127, 0, 0, 1]);
+    request.extend_from_slice(&80_u16.to_be_bytes());
+    client.write_all(&request).await.unwrap();
+
+    let reply = read_socks_reply(&mut client).await;
+    assert_eq!(reply, [0x05, 0x02, 0, 1, 0, 0, 0, 0, 0, 0]);
+}
+
+#[tokio::test]
 async fn returns_after_auth_failure_without_connecting_upstream() {
     let proxy_addr = start_one_shot_proxy(test_config()).await;
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -304,4 +340,73 @@ async fn same_listener_handles_socks5_and_http_connect_clients() {
     let mut http_response = [0_u8; 4];
     http_client.read_exact(&mut http_response).await.unwrap();
     assert_eq!(&http_response, b"ok-h");
+}
+
+#[tokio::test]
+async fn closes_client_that_never_sends_protocol_byte() {
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let mut buf = [0_u8; 1];
+    let read = timeout(Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0);
+}
+
+#[tokio::test]
+async fn closes_partial_socks5_handshake_after_timeout() {
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    client.write_all(&[0x05]).await.unwrap();
+
+    let mut buf = [0_u8; 1];
+    let read = timeout(Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0);
+}
+
+#[tokio::test]
+async fn closes_partial_http_connect_header_after_timeout() {
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    client.write_all(b"C").await.unwrap();
+
+    let mut buf = [0_u8; 1];
+    let read = timeout(Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0);
+}
+
+#[tokio::test]
+async fn handle_session_releases_resource_permit_when_done() {
+    let governor = ResourceGovernor::new(1);
+    let permit = governor.acquire_session().await.unwrap();
+    assert_eq!(governor.active_sessions(), 1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let session = Session::new(permit);
+    let config = test_config();
+
+    let server = tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        proxy_handler::handle_session(session, client, &config)
+            .await
+            .unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&[0x01]).await.unwrap();
+    server.await.unwrap();
+
+    assert_eq!(governor.active_sessions(), 0);
+    assert_eq!(governor.available_sessions(), 1);
 }

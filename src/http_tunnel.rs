@@ -7,7 +7,9 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::config::Config;
-use crate::proxy;
+use crate::destination::{self, ConnectError, DestinationPolicy};
+use crate::relay::{RelayConfig, RelayContext, RelayEngine};
+use crate::session::{ConnectionState, Session};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -46,6 +48,7 @@ pub struct ConnectTarget {
 /// client (e.g. Node.js/npm) can retry CONNECT with credentials on the
 /// same TCP socket without reconnecting.
 pub async fn handle_http_connect(
+    session: &mut Session,
     mut client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -67,12 +70,13 @@ pub async fn handle_http_connect(
     let mut auth_attempts: u8 = 0;
 
     let target = loop {
+        session.set_state(ConnectionState::Handshaking);
         // ── Read full HTTP header ──────────────────────────────────
         // First attempt uses the full connection timeout; subsequent attempts
         // (after a 407 challenge) use a short timeout so dead connections
         // are cleaned up quickly.
         let header_timeout = if auth_attempts == 0 {
-            Duration::from_secs(config.upstream_connection_timeout_sec)
+            Duration::from_secs(config.http_header_timeout_secs.max(1))
         } else {
             Duration::from_secs(RETRY_READ_TIMEOUT_SECS)
         };
@@ -96,9 +100,11 @@ pub async fn handle_http_connect(
         match parse_proxy_auth(&header_str) {
             Some((user, pass)) if user == config.auth_username && pass == config.auth_password => {
                 // Auth OK — proceed to tunnel
+                session.mark_authenticated();
                 break target;
             }
             Some(_) => {
+                session.mark_auth_failed();
                 auth_attempts += 1;
                 warn!(
                     status = "AUTH_FAILED",
@@ -114,6 +120,7 @@ pub async fn handle_http_connect(
                 write_response(&mut client, PROXY_AUTH_REQUIRED).await?;
             }
             None => {
+                session.mark_auth_failed();
                 auth_attempts += 1;
                 warn!(
                     status = "AUTH_MISSING",
@@ -130,6 +137,7 @@ pub async fn handle_http_connect(
         }
     };
 
+    session.set_target(target.host.clone(), target.port);
     let span = info_span!("http_tunnel", host = %target.host, port = target.port);
 
     async {
@@ -150,15 +158,24 @@ pub async fn handle_http_connect(
 
         debug!(status = "HTTP_CONNECT", "HTTP CONNECT request accepted");
 
+        session.set_state(ConnectionState::Connecting);
         let connect_timeout = Duration::from_secs(config.upstream_connection_timeout_sec);
-        let upstream = match timeout(
+        let policy = DestinationPolicy::new(config.allow_private_destinations);
+        let upstream = match destination::connect_tcp(
+            &target.host,
+            target.port,
             connect_timeout,
-            TcpStream::connect(format!("{}:{}", target.host, target.port)),
+            policy,
         )
         .await
         {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => {
+            Ok(stream) => stream,
+            Err(ConnectError::Blocked) => {
+                warn!(status = "DESTINATION_BLOCKED", "Rejected HTTP CONNECT destination by policy");
+                write_error_response(&mut client, FORBIDDEN).await?;
+                return Ok(());
+            }
+            Err(ConnectError::Connect(error)) => {
                 warn!(
                     status = "UPSTREAM_FAILED",
                     error_kind = ?error.kind(),
@@ -167,7 +184,16 @@ pub async fn handle_http_connect(
                 write_error_response(&mut client, BAD_GATEWAY).await?;
                 return Ok(());
             }
-            Err(_elapsed) => {
+            Err(ConnectError::Resolve(error)) => {
+                warn!(
+                    status = "RESOLVE_FAILED",
+                    error_kind = ?error.kind(),
+                    "Failed to resolve upstream for HTTP tunnel"
+                );
+                write_error_response(&mut client, BAD_GATEWAY).await?;
+                return Ok(());
+            }
+            Err(ConnectError::Timeout) => {
                 warn!(status = "UPSTREAM_TIMEOUT", "Upstream connection timed out");
                 write_error_response(&mut client, GATEWAY_TIMEOUT).await?;
                 return Ok(());
@@ -177,12 +203,24 @@ pub async fn handle_http_connect(
         write_response(&mut client, CONNECTION_ESTABLISHED).await?;
         debug!(status = "TUNNEL_ESTABLISHED", "HTTP tunnel established");
 
-        relay_with_idle(
-            client,
-            upstream,
+        session.set_state(ConnectionState::Relaying);
+        let relay = RelayEngine::new(RelayConfig::new(
+            config.relay_buffer_bytes,
             Duration::from_secs(config.idle_timeout_secs),
-        )
-        .await;
+            Duration::from_secs(config.relay_write_timeout_secs.max(1)),
+        ));
+        let _outcome = relay
+            .relay(
+                client,
+                upstream,
+                RelayContext {
+                    session_id: session.id(),
+                    protocol: session.protocol(),
+                    target: session.target().cloned(),
+                    cancellation: session.cancellation(),
+                },
+            )
+            .await;
 
         info!(status = "TUNNEL_CLOSED", "HTTP tunnel closed");
 
@@ -333,26 +371,6 @@ async fn write_error_response(client: &mut TcpStream, response: &[u8]) -> io::Re
     Ok(())
 }
 
-async fn relay_with_idle(client: TcpStream, upstream: TcpStream, idle_timeout: Duration) {
-    let (client_rd, client_wr) = client.into_split();
-    let (upstream_rd, upstream_wr) = upstream.into_split();
-
-    let upload = tokio::spawn(proxy::relay_with_idle(
-        client_rd,
-        upstream_wr,
-        idle_timeout,
-        "http_upload",
-    ));
-    let download = tokio::spawn(proxy::relay_with_idle(
-        upstream_rd,
-        client_wr,
-        idle_timeout,
-        "http_download",
-    ));
-
-    let _ = tokio::join!(upload, download);
-}
-
 /// Forward-proxy handler for plain `http://` requests.
 ///
 /// Called when the first byte is a plain HTTP method (`G`, `P`, `H`, `D`, `O`).
@@ -368,13 +386,15 @@ async fn relay_with_idle(client: TcpStream, upstream: TcpStream, idle_timeout: D
 /// 4. Connects to the upstream and writes the rewritten request (origin-form).
 /// 5. Relays the response back to the client.
 pub async fn handle_plain_http(
+    session: &mut Session,
     mut client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    session.set_state(ConnectionState::Handshaking);
     // Read the full HTTP request header.
     let header = match read_connect_header(
         &mut client,
-        Duration::from_secs(config.upstream_connection_timeout_sec),
+        Duration::from_secs(config.http_header_timeout_secs.max(1)),
     )
     .await?
     {
@@ -392,13 +412,17 @@ pub async fn handle_plain_http(
 
     // ── Authenticate ─────────────────────────────────────────────
     match parse_proxy_auth(header_str) {
-        Some((user, pass)) if user == config.auth_username && pass == config.auth_password => {}
+        Some((user, pass)) if user == config.auth_username && pass == config.auth_password => {
+            session.mark_authenticated();
+        }
         Some(_) => {
+            session.mark_auth_failed();
             warn!(status = "AUTH_FAILED", "Plain HTTP proxy authentication rejected");
             write_error_response(&mut client, PROXY_AUTH_REQUIRED_CLOSE).await?;
             return Ok(());
         }
         None => {
+            session.mark_auth_failed();
             warn!(status = "AUTH_MISSING", "Plain HTTP proxy missing Proxy-Authorization");
             write_error_response(&mut client, PROXY_AUTH_REQUIRED_CLOSE).await?;
             return Ok(());
@@ -453,23 +477,38 @@ pub async fn handle_plain_http(
         }
     };
 
+    session.set_target(host.clone(), port);
     let span = info_span!("http_forward", host = %host, port = port);
 
     async move {
+        session.set_state(ConnectionState::Connecting);
         let connect_timeout = Duration::from_secs(config.upstream_connection_timeout_sec);
-        let mut upstream = match timeout(
+        let policy = DestinationPolicy::new(config.allow_private_destinations);
+        let mut upstream = match destination::connect_tcp(
+            &host,
+            port,
             connect_timeout,
-            TcpStream::connect(format!("{}:{}", host, port)),
+            policy,
         )
         .await
         {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
+            Ok(s) => s,
+            Err(ConnectError::Blocked) => {
+                warn!(status = "DESTINATION_BLOCKED", "Rejected plain HTTP destination by policy");
+                write_error_response(&mut client, FORBIDDEN).await?;
+                return Ok(());
+            }
+            Err(ConnectError::Connect(e)) => {
                 warn!(status = "UPSTREAM_FAILED", error_kind = ?e.kind(), "Plain HTTP upstream connect failed");
                 write_error_response(&mut client, BAD_GATEWAY).await?;
                 return Ok(());
             }
-            Err(_) => {
+            Err(ConnectError::Resolve(e)) => {
+                warn!(status = "RESOLVE_FAILED", error_kind = ?e.kind(), "Plain HTTP upstream resolve failed");
+                write_error_response(&mut client, BAD_GATEWAY).await?;
+                return Ok(());
+            }
+            Err(ConnectError::Timeout) => {
                 warn!(status = "UPSTREAM_TIMEOUT", "Plain HTTP upstream connect timed out");
                 write_error_response(&mut client, GATEWAY_TIMEOUT).await?;
                 return Ok(());
@@ -487,7 +526,24 @@ pub async fn handle_plain_http(
 
         debug!(status = "HTTP_FORWARD", host = %host, port = port, "Plain HTTP request forwarded");
 
-        relay_with_idle(client, upstream, Duration::from_secs(config.idle_timeout_secs)).await;
+        session.set_state(ConnectionState::Relaying);
+        let relay = RelayEngine::new(RelayConfig::new(
+            config.relay_buffer_bytes,
+            Duration::from_secs(config.idle_timeout_secs),
+            Duration::from_secs(config.relay_write_timeout_secs.max(1)),
+        ));
+        let _outcome = relay
+            .relay(
+                client,
+                upstream,
+                RelayContext {
+                    session_id: session.id(),
+                    protocol: session.protocol(),
+                    target: session.target().cloned(),
+                    cancellation: session.cancellation(),
+                },
+            )
+            .await;
 
         info!(status = "HTTP_FORWARD_CLOSED", "Plain HTTP forward session closed");
         Ok(())

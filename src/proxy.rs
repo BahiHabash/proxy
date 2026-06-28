@@ -3,42 +3,72 @@
 //! connection metadata.
 
 use crate::config::Config;
+use crate::destination::{self, ConnectError, DestinationPolicy};
 use crate::http_tunnel;
+use crate::relay::{RelayConfig, RelayContext, RelayEngine};
+use crate::resource::ResourceGovernor;
+use crate::session::{ConnectionState, ProtocolKind, Session};
 use crate::socks5::{
-    self, HandshakeError, REP_CONNECTION_NOT_ALLOWED, REP_CONNECTION_REFUSED, REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE,
-    REP_NETWORK_UNREACHABLE, REP_SUCCESS, TargetAddr,
+    self, HandshakeError, REP_CONNECTION_NOT_ALLOWED, REP_CONNECTION_REFUSED,
+    REP_GENERAL_FAILURE, REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_SUCCESS,
 };
-use std::io::{self, ErrorKind};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::io::ErrorKind;
 use tokio::net::TcpStream;
-use tokio::task::JoinError;
 use tokio::time::{Duration, timeout};
-use tracing::{Instrument, debug, error, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 /// Handle one client session end-to-end.
 ///
 /// Peeks the first byte of the incoming stream to detect the protocol:
 /// - `0x05` → SOCKS5 (full auth + CONNECT handshake)
 /// - `0x43` (`C`) → HTTP CONNECT tunnel
-/// - HTTP method bytes (`G`, `P`, `H`, `D`, `O`) → rejected with 405
+/// - HTTP method bytes (`G`, `P`, `H`, `D`, `O`) → plain HTTP forwarding
 /// - anything else → rejected immediately (silent close)
 pub async fn handle_client(
     client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let resources = ResourceGovernor::new(1);
+    let permit = resources.acquire_session().await?;
+    let session = Session::new(permit);
+    handle_session(session, client, config).await
+}
+
+pub async fn handle_session(
+    mut session: Session,
+    client: TcpStream,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = client.set_nodelay(true);
     // ── Protocol detection via peek ────────────────────────────
+    session.set_state(ConnectionState::DetectingProtocol);
     let mut peek_buf = [0u8; 1];
-    let n = client.peek(&mut peek_buf).await?;
+    let detection_timeout = Duration::from_secs(config.protocol_detection_timeout_secs.max(1));
+    let n = match timeout(detection_timeout, client.peek(&mut peek_buf)).await {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            warn!(
+                status = "PROTOCOL_DETECTION_TIMEOUT",
+                "Client did not send protocol byte before timeout"
+            );
+            return Ok(());
+        }
+    };
     if n == 0 {
         // Client disconnected before sending any data.
+        session.set_state(ConnectionState::Closed);
         return Ok(());
     }
 
-    match peek_buf[0] {
-        0x05 => handle_socks5(client, config).await,
+    let result = match peek_buf[0] {
+        0x05 => {
+            session.set_protocol(ProtocolKind::Socks5);
+            handle_socks5(&mut session, client, config).await
+        }
         b'C' => {
+            session.set_protocol(ProtocolKind::HttpConnect);
             debug!(status = "HTTP_CONNECT_DETECTED", "Routing to HTTP CONNECT handler");
-            http_tunnel::handle_http_connect(client, config).await
+            http_tunnel::handle_http_connect(&mut session, client, config).await
         }
         // Plain HTTP method bytes sent by clients that route http:// through
         // the proxy (e.g. Node.js proxy-from-env, MCP SSE connections).
@@ -46,8 +76,9 @@ pub async fn handle_client(
         // to the target host extracted from the absolute-form URI or Host
         // header, write the request verbatim, and relay the response.
         b'G' | b'P' | b'H' | b'D' | b'O' => {
+            session.set_protocol(ProtocolKind::PlainHttp);
             debug!(status = "PLAIN_HTTP_DETECTED", "Routing to HTTP forward-proxy handler");
-            http_tunnel::handle_plain_http(client, config).await
+            http_tunnel::handle_plain_http(&mut session, client, config).await
         }
         other => {
             warn!(
@@ -57,29 +88,47 @@ pub async fn handle_client(
             );
             Ok(())
         }
-    }
+    };
+
+    session.set_state(ConnectionState::Closed);
+    result
 }
 
 
 
 /// Handle one SOCKS5 client session end-to-end.
 async fn handle_socks5(
+    session: &mut Session,
     mut client: TcpStream,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let target = match socks5::handshake(
-        &mut client,
-        &config.auth_username,
-        &config.auth_password,
+    session.set_state(ConnectionState::Handshaking);
+    let handshake_timeout = Duration::from_secs(config.socks5_handshake_timeout_secs.max(1));
+    let target = match timeout(
+        handshake_timeout,
+        socks5::handshake(
+            &mut client,
+            &config.auth_username,
+            &config.auth_password,
+        ),
     )
     .await
     {
-        Ok(target) => target,
-        Err(error) => {
+        Ok(Ok(target)) => target,
+        Ok(Err(error)) => {
+            if matches!(error, HandshakeError::AuthFailed) {
+                session.mark_auth_failed();
+            }
             log_handshake_error(&error);
             return Ok(());
         }
+        Err(_elapsed) => {
+            warn!(status = "SOCKS5_HANDSHAKE_TIMEOUT", "SOCKS5 handshake timed out");
+            return Ok(());
+        }
     };
+    session.mark_authenticated();
+    session.set_target(target.host(), target.port());
 
     let span = info_span!("socks5_tunnel", host = %target.host(), port = target.port());
 
@@ -91,32 +140,35 @@ async fn handle_socks5(
             return Ok(());
         }
 
+        let policy = DestinationPolicy::new(config.allow_private_destinations);
+        if let Err(error) = policy.validate_host(&target.host(), target.port()) {
+            let _ = socks5::send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED).await;
+            warn!(
+                status = "DESTINATION_BLOCKED",
+                reason = %error,
+                "Rejected SOCKS5 destination by policy"
+            );
+            return Ok(());
+        }
+
         debug!(status = "REQUEST_ACCEPTED", "CONNECT request accepted");
 
+        session.set_state(ConnectionState::Connecting);
         let connect_timeout = Duration::from_secs(config.upstream_connection_timeout_sec);
-        let upstream_result = match &target {
-            TargetAddr::Domain(host, port) => {
-                timeout(
-                    connect_timeout,
-                    TcpStream::connect(format!("{}:{}", host, port)),
-                )
-                .await
-            }
-            TargetAddr::Ip4(ip, port) => {
-                timeout(connect_timeout, TcpStream::connect((*ip, *port))).await
-            }
-            TargetAddr::Ip6(ip, port) => {
-                timeout(connect_timeout, TcpStream::connect((*ip, *port))).await
-            }
-        };
-
-        let upstream = match upstream_result {
-            Ok(Ok(stream)) => {
+        let upstream = match destination::connect_tcp(
+            &target.host(),
+            target.port(),
+            connect_timeout,
+            policy,
+        )
+        .await
+        {
+            Ok(stream) => {
                 socks5::send_reply(&mut client, REP_SUCCESS).await?;
                 debug!(status = "CONNECTED", "Upstream connection established");
                 stream
             }
-            Ok(Err(error)) => {
+            Err(ConnectError::Connect(error)) => {
                 let reply = match error.kind() {
                     ErrorKind::ConnectionRefused => REP_CONNECTION_REFUSED,
                     ErrorKind::AddrNotAvailable | ErrorKind::ConnectionAborted => {
@@ -133,33 +185,45 @@ async fn handle_socks5(
                 );
                 return Ok(());
             }
-            Err(_elapsed) => {
+            Err(ConnectError::Resolve(error)) => {
+                let _ = socks5::send_reply(&mut client, REP_HOST_UNREACHABLE).await;
+                warn!(
+                    status = "RESOLVE_FAILED",
+                    error_kind = ?error.kind(),
+                    "Failed to resolve upstream"
+                );
+                return Ok(());
+            }
+            Err(ConnectError::Blocked) => {
+                let _ = socks5::send_reply(&mut client, REP_CONNECTION_NOT_ALLOWED).await;
+                warn!(status = "DESTINATION_BLOCKED", "Rejected SOCKS5 destination by policy");
+                return Ok(());
+            }
+            Err(ConnectError::Timeout) => {
                 let _ = socks5::send_reply(&mut client, REP_GENERAL_FAILURE).await;
                 warn!(status = "CONNECT_TIMEOUT", "Upstream connection timed out");
                 return Ok(());
             }
         };
 
-        let (client_rd, client_wr) = client.into_split();
-        let (upstream_rd, upstream_wr) = upstream.into_split();
-        let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
-
-        let upload = tokio::spawn(relay_with_idle(
-            client_rd,
-            upstream_wr,
-            idle_timeout,
-            "upload",
+        session.set_state(ConnectionState::Relaying);
+        let relay = RelayEngine::new(RelayConfig::new(
+            config.relay_buffer_bytes,
+            Duration::from_secs(config.idle_timeout_secs),
+            Duration::from_secs(config.relay_write_timeout_secs.max(1)),
         ));
-        let download = tokio::spawn(relay_with_idle(
-            upstream_rd,
-            client_wr,
-            idle_timeout,
-            "download",
-        ));
-
-        let (upload_result, download_result) = tokio::join!(upload, download);
-        log_relay_result("upload", upload_result);
-        log_relay_result("download", download_result);
+        let _outcome = relay
+            .relay(
+                client,
+                upstream,
+                RelayContext {
+                    session_id: session.id(),
+                    protocol: session.protocol(),
+                    target: session.target().cloned(),
+                    cancellation: session.cancellation(),
+                },
+            )
+            .await;
 
         info!(status = "CLOSED", "SOCKS5 session complete");
         Ok(())
@@ -183,63 +247,3 @@ fn log_handshake_error(error: &HandshakeError) {
     }
 }
 
-pub(crate) async fn relay_with_idle<R, W>(
-    mut reader: R,
-    mut writer: W,
-    idle_timeout: Duration,
-    direction: &'static str,
-) -> io::Result<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        let bytes_read = match timeout(idle_timeout, reader.read(&mut buffer)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(bytes_read)) => bytes_read,
-            Ok(Err(error)) => {
-                let _ = writer.shutdown().await;
-                return Err(error);
-            }
-            Err(_elapsed) => {
-                warn!(
-                    direction = direction,
-                    status = "IDLE_TIMEOUT",
-                    "Idle timeout; closing relay"
-                );
-                break;
-            }
-        };
-
-        if let Err(error) = writer.write_all(&buffer[..bytes_read]).await {
-            let _ = writer.shutdown().await;
-            return Err(error);
-        }
-    }
-
-    writer.shutdown().await
-}
-
-fn log_relay_result(direction: &'static str, result: Result<io::Result<()>, JoinError>) {
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            warn!(
-                direction = direction,
-                status = "RELAY_ERROR",
-                error_kind = ?error.kind(),
-                "Relay closed after I/O error"
-            );
-        }
-        Err(error) => {
-            error!(
-                direction = direction,
-                status = "RELAY_TASK_FAILED",
-                error = %error,
-                "Relay task failed"
-            );
-        }
-    }
-}

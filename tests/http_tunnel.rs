@@ -16,6 +16,21 @@ fn test_config() -> Config {
         idle_timeout_secs: 1,
         log_format: "pretty".into(),
         upstream_connection_timeout_sec: 1,
+        relay_buffer_bytes: 16 * 1024,
+        relay_write_timeout_secs: 1,
+        max_connections: 1024,
+        protocol_detection_timeout_secs: 1,
+        socks5_handshake_timeout_secs: 1,
+        http_header_timeout_secs: 1,
+        accept_error_backoff_ms: 10,
+        accept_error_log_interval_secs: 1,
+        log_to_stdout: true,
+        log_to_file: false,
+        log_dir: "logs".into(),
+        log_max_file_bytes: 1024 * 1024,
+        log_max_files: 2,
+        allow_private_destinations: true,
+        shutdown_timeout_secs: 1,
     }
 }
 
@@ -256,4 +271,64 @@ async fn http_connect_accepts_http_1_0_connect() {
 
     let response = read_http_response_head(&mut client).await;
     assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+}
+
+#[tokio::test]
+async fn http_connect_blocks_private_destinations_when_policy_disallows_them() {
+    let mut config = test_config();
+    config.allow_private_destinations = false;
+    let proxy_addr = start_one_shot_proxy(config).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = "CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n";
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(
+        response,
+        "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+}
+
+#[tokio::test]
+async fn plain_http_forwards_request_body_through_relay_engine() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/messages HTTP/1.1"));
+
+        let mut body = [0_u8; 4];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"ping");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong")
+            .await
+            .unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!(
+        "POST http://127.0.0.1:{}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nContent-Length: 4\r\n\r\nping",
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n");
+    let mut body = [0_u8; 4];
+    client.read_exact(&mut body).await.unwrap();
+    assert_eq!(&body, b"pong");
 }
