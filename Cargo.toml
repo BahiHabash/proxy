@@ -1,0 +1,23 @@
+[package]
+name = "proxy"
+version = "1.0.0"
+edition = "2024"
+description = "Production-ready SOCKS5 proxy server with RFC 1928/1929 compliance, observability logging, and SSE/WebSocket transparency."
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
+dotenvy = "0.15"
+ctrlc = { version = "3", features = ["termination"] }
+thiserror = "2"
+anyhow = "1"
+base64 = "0.22"
+tracing-appender = "0.2.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

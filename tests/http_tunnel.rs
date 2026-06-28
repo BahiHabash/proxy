@@ -1,0 +1,334 @@
+use proxy::config::Config;
+use proxy::proxy as proxy_handler;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Duration, timeout};
+
+const USER: &str = "user";
+const PASS: &str = "pass";
+
+fn test_config() -> Config {
+    Config {
+        bind_host: "127.0.0.1".into(),
+        bind_port: 0,
+        auth_username: USER.into(),
+        auth_password: PASS.into(),
+        idle_timeout_secs: 1,
+        log_format: "pretty".into(),
+        upstream_connection_timeout_sec: 1,
+        relay_buffer_bytes: 16 * 1024,
+        relay_write_timeout_secs: 1,
+        max_connections: 1024,
+        protocol_detection_timeout_secs: 1,
+        socks5_handshake_timeout_secs: 1,
+        http_header_timeout_secs: 1,
+        accept_error_backoff_ms: 10,
+        accept_error_log_interval_secs: 1,
+        log_to_stdout: true,
+        log_to_file: false,
+        log_dir: "logs".into(),
+        log_max_file_bytes: 1024 * 1024,
+        log_max_files: 2,
+        allow_private_destinations: true,
+        shutdown_timeout_secs: 1,
+    }
+}
+
+async fn start_one_shot_proxy(config: Config) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        proxy_handler::handle_client(client, &config).await.unwrap();
+    });
+
+    addr
+}
+
+async fn read_http_response_head(client: &mut TcpStream) -> String {
+    let mut response = Vec::new();
+    let mut byte = [0_u8; 1];
+
+    loop {
+        client.read_exact(&mut byte).await.unwrap();
+        response.push(byte[0]);
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    String::from_utf8(response).unwrap()
+}
+
+#[tokio::test]
+async fn http_connect_relays_bidirectional_tcp() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = [0_u8; 4];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    client.write_all(b"ping").await.unwrap();
+    let mut payload = [0_u8; 4];
+    client.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"pong");
+}
+
+#[tokio::test]
+async fn http_connect_preserves_payload_sent_after_headers() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = [0_u8; 5];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"early");
+        stream.write_all(b"reply").await.unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\nearly",
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    let mut payload = [0_u8; 5];
+    client.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"reply");
+}
+
+#[tokio::test]
+async fn http_connect_rejects_malformed_connect_request() {
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    client
+        .write_all(b"CONNECT missing-port:notanumber HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+}
+
+#[tokio::test]
+async fn http_connect_rejects_oversized_headers() {
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    client.write_all(&vec![b'C'; 8193]).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(
+        response,
+        "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+}
+
+#[tokio::test]
+async fn http_connect_returns_bad_gateway_when_upstream_refuses() {
+    let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_addr = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+        closed_addr.port(),
+        closed_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert!(
+        response == "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            || response == "HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+}
+
+#[tokio::test]
+async fn http_connect_closes_idle_tunnel_without_payload() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (_stream, _) = upstream.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    let mut buf = [0_u8; 1];
+    let read = timeout(Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0);
+}
+
+#[tokio::test]
+async fn http_connect_rejects_unauthenticated() {
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = format!(
+        "CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n"
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n");
+}
+
+/// Codex CLI and some LangChain HTTP adapters send lowercase `basic` scheme.
+/// This is allowed by RFC 7235 (auth-scheme is case-insensitive).
+#[tokio::test]
+async fn http_connect_accepts_lowercase_basic_auth_scheme() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        stream.write_all(b"ok").await.unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    // "dXNlcjpwYXNz" == base64("user:pass")
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: basic dXNlcjpwYXNz\r\n\r\n",
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+}
+
+/// Some older curl builds and AI tooling wrappers send HTTP/1.0 CONNECT.
+/// We must accept it just like HTTP/1.1.
+#[tokio::test]
+async fn http_connect_accepts_http_1_0_connect() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        stream.write_all(b"ok").await.unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    // HTTP/1.0 instead of HTTP/1.1
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.0\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\n");
+}
+
+#[tokio::test]
+async fn http_connect_blocks_private_destinations_when_policy_disallows_them() {
+    let mut config = test_config();
+    config.allow_private_destinations = false;
+    let proxy_addr = start_one_shot_proxy(config).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+    let request = "CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n";
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(
+        response,
+        "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+}
+
+#[tokio::test]
+async fn plain_http_forwards_request_body_through_relay_engine() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/messages HTTP/1.1"));
+
+        let mut body = [0_u8; 4];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"ping");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong")
+            .await
+            .unwrap();
+    });
+
+    let proxy_addr = start_one_shot_proxy(test_config()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!(
+        "POST http://127.0.0.1:{}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nContent-Length: 4\r\n\r\nping",
+        upstream_addr.port(),
+        upstream_addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_http_response_head(&mut client).await;
+    assert_eq!(response, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n");
+    let mut body = [0_u8; 4];
+    client.read_exact(&mut body).await.unwrap();
+    assert_eq!(&body, b"pong");
+}
