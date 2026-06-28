@@ -14,6 +14,7 @@ ctrlc = { version = "3", features = ["termination"] }
 thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
+tracing-appender = "0.2.5"
 
 [profile.release]
 opt-level = 3

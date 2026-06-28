@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     let config = Config::from_env();
-    config.init_logging();
+    let _log_guard = config.init_logging();
 
     info!(
         bind = %config.bind_addr(),

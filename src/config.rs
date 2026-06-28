@@ -66,19 +66,30 @@ impl Config {
     }
 
     /// Initialize the global tracing subscriber.
-    pub fn init_logging(&self) {
+    pub fn init_logging(&self) -> tracing_appender::non_blocking::WorkerGuard {
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+        let file_appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("proxy.log")
+            .max_log_files(5)
+            .build("logs")
+            .expect("failed to initialize rolling file appender");
+
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
         if self.log_format == "json" {
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt::layer().json())
+                .with(fmt::layer().json().with_writer(non_blocking))
                 .init();
         } else {
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt::layer().pretty())
+                .with(fmt::layer().pretty().with_writer(non_blocking))
                 .init();
         }
+
+        guard
     }
 }
